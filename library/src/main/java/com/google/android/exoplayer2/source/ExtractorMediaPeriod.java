@@ -17,6 +17,7 @@ package com.google.android.exoplayer2.source;
 
 import android.net.Uri;
 import android.os.Handler;
+import android.util.SparseArray;
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.Format;
 import com.google.android.exoplayer2.FormatHolder;
@@ -41,7 +42,6 @@ import com.google.android.exoplayer2.util.ConditionVariable;
 import com.google.android.exoplayer2.util.Util;
 import java.io.EOFException;
 import java.io.IOException;
-import java.util.Arrays;
 
 /**
  * A {@link MediaPeriod} that extracts data using an {@link Extractor}.
@@ -61,12 +61,16 @@ import java.util.Arrays;
   private final Handler eventHandler;
   private final ExtractorMediaSource.EventListener eventListener;
   private final MediaSource.Listener sourceListener;
-  private final Callback callback;
   private final Allocator allocator;
   private final Loader loader;
   private final ExtractorHolder extractorHolder;
   private final ConditionVariable loadCondition;
+  private final Runnable maybeFinishPrepareRunnable;
+  private final Runnable onContinueLoadingRequestedRunnable;
+  private final Handler handler;
+  private final SparseArray<DefaultTrackOutput> sampleQueues;
 
+  private Callback callback;
   private SeekMap seekMap;
   private boolean tracksBuilt;
   private boolean prepared;
@@ -74,7 +78,6 @@ import java.util.Arrays;
   private boolean seenFirstTrackSelection;
   private boolean notifyReset;
   private int enabledTrackCount;
-  private DefaultTrackOutput[] sampleQueues;
   private TrackGroupArray tracks;
   private long durationUs;
   private boolean[] trackEnabledStates;
@@ -85,6 +88,7 @@ import java.util.Arrays;
 
   private int extractedSamplesCountAtStartOfLoad;
   private boolean loadingFinished;
+  private boolean released;
 
   /**
    * @param uri The {@link Uri} of the media stream.
@@ -94,30 +98,41 @@ import java.util.Arrays;
    * @param eventHandler A handler for events. May be null if delivery of events is not required.
    * @param eventListener A listener of events. May be null if delivery of events is not required.
    * @param sourceListener A listener to notify when the timeline has been loaded.
-   * @param callback A callback to receive updates from the period.
    * @param allocator An {@link Allocator} from which to obtain media buffer allocations.
    */
   public ExtractorMediaPeriod(Uri uri, DataSource dataSource, Extractor[] extractors,
       int minLoadableRetryCount, Handler eventHandler,
       ExtractorMediaSource.EventListener eventListener, MediaSource.Listener sourceListener,
-      Callback callback, Allocator allocator) {
+      Allocator allocator) {
     this.uri = uri;
     this.dataSource = dataSource;
     this.minLoadableRetryCount = minLoadableRetryCount;
     this.eventHandler = eventHandler;
     this.eventListener = eventListener;
     this.sourceListener = sourceListener;
-    this.callback = callback;
     this.allocator = allocator;
     loader = new Loader("Loader:ExtractorMediaPeriod");
     extractorHolder = new ExtractorHolder(extractors, this);
     loadCondition = new ConditionVariable();
+    maybeFinishPrepareRunnable = new Runnable() {
+      @Override
+      public void run() {
+        maybeFinishPrepare();
+      }
+    };
+    onContinueLoadingRequestedRunnable = new Runnable() {
+      @Override
+      public void run() {
+        if (!released) {
+          callback.onContinueLoadingRequested(ExtractorMediaPeriod.this);
+        }
+      }
+    };
+    handler = new Handler();
 
     pendingResetPositionUs = C.TIME_UNSET;
-    sampleQueues = new DefaultTrackOutput[0];
+    sampleQueues = new SparseArray<>();
     length = C.LENGTH_UNSET;
-    loadCondition.open();
-    startLoading();
   }
 
   public void release() {
@@ -126,11 +141,21 @@ import java.util.Arrays;
       @Override
       public void run() {
         extractorHolder.release();
+        int trackCount = sampleQueues.size();
+        for (int i = 0; i < trackCount; i++) {
+          sampleQueues.valueAt(i).disable();
+        }
       }
     });
-    for (DefaultTrackOutput sampleQueue : sampleQueues) {
-      sampleQueue.disable();
-    }
+    handler.removeCallbacksAndMessages(null);
+    released = true;
+  }
+
+  @Override
+  public void prepare(Callback callback) {
+    this.callback = callback;
+    loadCondition.open();
+    startLoading();
   }
 
   @Override
@@ -154,7 +179,7 @@ import java.util.Arrays;
         Assertions.checkState(trackEnabledStates[track]);
         enabledTrackCount--;
         trackEnabledStates[track] = false;
-        sampleQueues[track].disable();
+        sampleQueues.valueAt(track).disable();
         streams[i] = null;
       }
     }
@@ -177,9 +202,10 @@ import java.util.Arrays;
     if (!seenFirstTrackSelection) {
       // At the time of the first track selection all queues will be enabled, so we need to disable
       // any that are no longer required.
-      for (int i = 0; i < sampleQueues.length; i++) {
+      int trackCount = sampleQueues.size();
+      for (int i = 0; i < trackCount; i++) {
         if (!trackEnabledStates[i]) {
-          sampleQueues[i].disable();
+          sampleQueues.valueAt(i).disable();
         }
       }
     }
@@ -246,11 +272,12 @@ import java.util.Arrays;
     // Treat all seeks into non-seekable media as being to t=0.
     positionUs = seekMap.isSeekable() ? positionUs : 0;
     lastSeekPositionUs = positionUs;
+    int trackCount = sampleQueues.size();
     // If we're not pending a reset, see if we can seek within the sample queues.
     boolean seekInsideBuffer = !isPendingReset();
-    for (int i = 0; seekInsideBuffer && i < sampleQueues.length; i++) {
+    for (int i = 0; seekInsideBuffer && i < trackCount; i++) {
       if (trackEnabledStates[i]) {
-        seekInsideBuffer = sampleQueues[i].skipToKeyframeBefore(positionUs);
+        seekInsideBuffer = sampleQueues.valueAt(i).skipToKeyframeBefore(positionUs);
       }
     }
     // If we failed to seek within the sample queues, we need to restart.
@@ -260,8 +287,8 @@ import java.util.Arrays;
       if (loader.isLoading()) {
         loader.cancelLoading();
       } else {
-        for (int i = 0; i < sampleQueues.length; i++) {
-          sampleQueues[i].reset(trackEnabledStates[i]);
+        for (int i = 0; i < trackCount; i++) {
+          sampleQueues.valueAt(i).reset(trackEnabledStates[i]);
         }
       }
     }
@@ -272,7 +299,7 @@ import java.util.Arrays;
   // SampleStream methods.
 
   /* package */ boolean isReady(int track) {
-    return loadingFinished || (!isPendingReset() && !sampleQueues[track].isEmpty());
+    return loadingFinished || (!isPendingReset() && !sampleQueues.valueAt(track).isEmpty());
   }
 
   /* package */ void maybeThrowError() throws IOException {
@@ -284,7 +311,8 @@ import java.util.Arrays;
       return C.RESULT_NOTHING_READ;
     }
 
-    return sampleQueues[track].readData(formatHolder, buffer, loadingFinished, lastSeekPositionUs);
+    return sampleQueues.valueAt(track).readData(formatHolder, buffer, loadingFinished,
+        lastSeekPositionUs);
   }
 
   // Loader.Callback implementation.
@@ -308,8 +336,9 @@ import java.util.Arrays;
       long loadDurationMs, boolean released) {
     copyLengthFromLoader(loadable);
     if (!released && enabledTrackCount > 0) {
-      for (int i = 0; i < sampleQueues.length; i++) {
-        sampleQueues[i].reset(trackEnabledStates[i]);
+      int trackCount = sampleQueues.size();
+      for (int i = 0; i < trackCount; i++) {
+        sampleQueues.valueAt(i).reset(trackEnabledStates[i]);
       }
       callback.onContinueLoadingRequested(this);
     }
@@ -330,54 +359,56 @@ import java.util.Arrays;
     return madeProgress ? Loader.RETRY_RESET_ERROR_COUNT : Loader.RETRY;
   }
 
-  // ExtractorOutput implementation.
+  // ExtractorOutput implementation. Called by the loading thread.
 
   @Override
   public TrackOutput track(int id) {
-    sampleQueues = Arrays.copyOf(sampleQueues, sampleQueues.length + 1);
-    DefaultTrackOutput sampleQueue = new DefaultTrackOutput(allocator);
-    sampleQueue.setUpstreamFormatChangeListener(this);
-    sampleQueues[sampleQueues.length - 1] = sampleQueue;
-    return sampleQueue;
+    DefaultTrackOutput trackOutput = sampleQueues.get(id);
+    if (trackOutput == null) {
+      trackOutput = new DefaultTrackOutput(allocator);
+      trackOutput.setUpstreamFormatChangeListener(this);
+      sampleQueues.put(id, trackOutput);
+    }
+    return trackOutput;
   }
 
   @Override
   public void endTracks() {
     tracksBuilt = true;
-    maybeFinishPrepare();
+    handler.post(maybeFinishPrepareRunnable);
   }
 
   @Override
   public void seekMap(SeekMap seekMap) {
     this.seekMap = seekMap;
-    maybeFinishPrepare();
+    handler.post(maybeFinishPrepareRunnable);
   }
 
-  // UpstreamFormatChangedListener implementation
+  // UpstreamFormatChangedListener implementation. Called by the loading thread.
 
   @Override
   public void onUpstreamFormatChanged(Format format) {
-    maybeFinishPrepare();
+    handler.post(maybeFinishPrepareRunnable);
   }
 
   // Internal methods.
 
   private void maybeFinishPrepare() {
-    if (prepared || seekMap == null || !tracksBuilt) {
+    if (released || prepared || seekMap == null || !tracksBuilt) {
       return;
     }
-    for (DefaultTrackOutput sampleQueue : sampleQueues) {
-      if (sampleQueue.getUpstreamFormat() == null) {
+    int trackCount = sampleQueues.size();
+    for (int i = 0; i < trackCount; i++) {
+      if (sampleQueues.valueAt(i).getUpstreamFormat() == null) {
         return;
       }
     }
     loadCondition.close();
-    int trackCount = sampleQueues.length;
     TrackGroup[] trackArray = new TrackGroup[trackCount];
     trackEnabledStates = new boolean[trackCount];
     durationUs = seekMap.getDurationUs();
     for (int i = 0; i < trackCount; i++) {
-      trackArray[i] = new TrackGroup(sampleQueues[i].getUpstreamFormat());
+      trackArray[i] = new TrackGroup(sampleQueues.valueAt(i).getUpstreamFormat());
     }
     tracks = new TrackGroupArray(trackArray);
     prepared = true;
@@ -431,8 +462,9 @@ import java.util.Arrays;
       // a new load.
       lastSeekPositionUs = 0;
       notifyReset = prepared;
-      for (int i = 0; i < sampleQueues.length; i++) {
-        sampleQueues[i].reset(trackEnabledStates[i]);
+      int trackCount = sampleQueues.size();
+      for (int i = 0; i < trackCount; i++) {
+        sampleQueues.valueAt(i).reset(!prepared || trackEnabledStates[i]);
       }
       loadable.setLoadPosition(0);
     }
@@ -440,17 +472,19 @@ import java.util.Arrays;
 
   private int getExtractedSamplesCount() {
     int extractedSamplesCount = 0;
-    for (DefaultTrackOutput sampleQueue : sampleQueues) {
-      extractedSamplesCount += sampleQueue.getWriteIndex();
+    int trackCount = sampleQueues.size();
+    for (int i = 0; i < trackCount; i++) {
+      extractedSamplesCount += sampleQueues.valueAt(i).getWriteIndex();
     }
     return extractedSamplesCount;
   }
 
   private long getLargestQueuedTimestampUs() {
     long largestQueuedTimestampUs = Long.MIN_VALUE;
-    for (DefaultTrackOutput sampleQueue : sampleQueues) {
+    int trackCount = sampleQueues.size();
+    for (int i = 0; i < trackCount; i++) {
       largestQueuedTimestampUs = Math.max(largestQueuedTimestampUs,
-          sampleQueue.getLargestQueuedTimestampUs());
+          sampleQueues.valueAt(i).getLargestQueuedTimestampUs());
     }
     return largestQueuedTimestampUs;
   }
@@ -499,7 +533,7 @@ import java.util.Arrays;
 
     @Override
     public void skipToKeyframeBefore(long timeUs) {
-      sampleQueues[track].skipToKeyframeBefore(timeUs);
+      sampleQueues.valueAt(track).skipToKeyframeBefore(timeUs);
     }
 
   }
@@ -576,7 +610,7 @@ import java.util.Arrays;
             if (input.getPosition() > position + CONTINUE_LOADING_CHECK_INTERVAL_BYTES) {
               position = input.getPosition();
               loadCondition.close();
-              callback.onContinueLoadingRequested(ExtractorMediaPeriod.this);
+              handler.post(onContinueLoadingRequestedRunnable);
             }
           }
         } finally {

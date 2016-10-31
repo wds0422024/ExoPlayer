@@ -33,6 +33,7 @@ import com.google.android.exoplayer2.audio.AudioTrack;
 import com.google.android.exoplayer2.audio.MediaCodecAudioRenderer;
 import com.google.android.exoplayer2.decoder.DecoderCounters;
 import com.google.android.exoplayer2.drm.DrmSessionManager;
+import com.google.android.exoplayer2.drm.FrameworkMediaCrypto;
 import com.google.android.exoplayer2.mediacodec.MediaCodecSelector;
 import com.google.android.exoplayer2.metadata.MetadataRenderer;
 import com.google.android.exoplayer2.metadata.id3.Id3Decoder;
@@ -40,6 +41,7 @@ import com.google.android.exoplayer2.metadata.id3.Id3Frame;
 import com.google.android.exoplayer2.source.MediaSource;
 import com.google.android.exoplayer2.text.Cue;
 import com.google.android.exoplayer2.text.TextRenderer;
+import com.google.android.exoplayer2.trackselection.TrackSelections;
 import com.google.android.exoplayer2.trackselection.TrackSelector;
 import com.google.android.exoplayer2.video.MediaCodecVideoRenderer;
 import com.google.android.exoplayer2.video.VideoRendererEventListener;
@@ -80,18 +82,14 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
     /**
      * Called when a frame is rendered for the first time since setting the surface, and when a
-     * frame is rendered for the first time since the renderer was reset.
-     *
-     * @param surface The {@link Surface} to which a first frame has been rendered.
+     * frame is rendered for the first time since a video track was selected.
      */
-    void onRenderedFirstFrame(Surface surface);
+    void onRenderedFirstFrame();
 
     /**
-     * Called when the renderer is disabled.
-     *
-     * @param counters {@link DecoderCounters} that were updated by the renderer.
+     * Called when a video track is no longer selected.
      */
-    void onVideoDisabled(DecoderCounters counters);
+    void onVideoTracksDisabled();
 
   }
 
@@ -105,9 +103,12 @@ public final class SimpleExoPlayer implements ExoPlayer {
   private final int videoRendererCount;
   private final int audioRendererCount;
 
+  private boolean videoTracksEnabled;
   private Format videoFormat;
   private Format audioFormat;
 
+  private Surface surface;
+  private boolean ownsSurface;
   private SurfaceHolder surfaceHolder;
   private TextureView textureView;
   private TextRenderer.Output textOutput;
@@ -121,11 +122,12 @@ public final class SimpleExoPlayer implements ExoPlayer {
   private float volume;
   private PlaybackParamsHolder playbackParamsHolder;
 
-  /* package */ SimpleExoPlayer(Context context, TrackSelector trackSelector,
-      LoadControl loadControl, DrmSessionManager drmSessionManager,
+  /* package */ SimpleExoPlayer(Context context, TrackSelector<?> trackSelector,
+      LoadControl loadControl, DrmSessionManager<FrameworkMediaCrypto> drmSessionManager,
       boolean preferExtensionDecoders, long allowedVideoJoiningTimeMs) {
     mainHandler = new Handler();
     componentListener = new ComponentListener();
+    trackSelector.addListener(componentListener);
 
     // Build the renderers.
     ArrayList<Renderer> renderersList = new ArrayList<>();
@@ -183,6 +185,14 @@ public final class SimpleExoPlayer implements ExoPlayer {
   }
 
   /**
+   * Clears any {@link Surface}, {@link SurfaceHolder}, {@link SurfaceView} or {@link TextureView}
+   * currently set on the player.
+   */
+  public void clearVideoSurface() {
+    setVideoSurface(null);
+  }
+
+  /**
    * Sets the {@link Surface} onto which video will be rendered. The caller is responsible for
    * tracking the lifecycle of the surface, and must clear the surface by calling
    * {@code setVideoSurface(null)} if the surface is destroyed.
@@ -197,7 +207,7 @@ public final class SimpleExoPlayer implements ExoPlayer {
    */
   public void setVideoSurface(Surface surface) {
     removeSurfaceCallbacks();
-    setVideoSurfaceInternal(surface);
+    setVideoSurfaceInternal(surface, false);
   }
 
   /**
@@ -210,9 +220,9 @@ public final class SimpleExoPlayer implements ExoPlayer {
     removeSurfaceCallbacks();
     this.surfaceHolder = surfaceHolder;
     if (surfaceHolder == null) {
-      setVideoSurfaceInternal(null);
+      setVideoSurfaceInternal(null, false);
     } else {
-      setVideoSurfaceInternal(surfaceHolder.getSurface());
+      setVideoSurfaceInternal(surfaceHolder.getSurface(), false);
       surfaceHolder.addCallback(componentListener);
     }
   }
@@ -237,10 +247,13 @@ public final class SimpleExoPlayer implements ExoPlayer {
     removeSurfaceCallbacks();
     this.textureView = textureView;
     if (textureView == null) {
-      setVideoSurfaceInternal(null);
+      setVideoSurfaceInternal(null, true);
     } else {
+      if (textureView.getSurfaceTextureListener() != null) {
+        Log.w(TAG, "Replacing existing SurfaceTextureListener.");
+      }
       SurfaceTexture surfaceTexture = textureView.getSurfaceTexture();
-      setVideoSurfaceInternal(surfaceTexture == null ? null : new Surface(surfaceTexture));
+      setVideoSurfaceInternal(surfaceTexture == null ? null : new Surface(surfaceTexture), true);
       textureView.setSurfaceTextureListener(componentListener);
     }
   }
@@ -408,8 +421,8 @@ public final class SimpleExoPlayer implements ExoPlayer {
   }
 
   @Override
-  public void prepare(MediaSource mediaSource, boolean resetPosition) {
-    player.prepare(mediaSource, resetPosition);
+  public void prepare(MediaSource mediaSource, boolean resetPosition, boolean resetTimeline) {
+    player.prepare(mediaSource, resetPosition, resetTimeline);
   }
 
   @Override
@@ -455,6 +468,13 @@ public final class SimpleExoPlayer implements ExoPlayer {
   @Override
   public void release() {
     player.release();
+    removeSurfaceCallbacks();
+    if (surface != null) {
+      if (ownsSurface) {
+        surface.release();
+      }
+      surface = null;
+    }
   }
 
   @Override
@@ -509,8 +529,9 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
   // Internal methods.
 
-  private void buildRenderers(Context context, DrmSessionManager drmSessionManager,
-      ArrayList<Renderer> renderersList, long allowedVideoJoiningTimeMs) {
+  private void buildRenderers(Context context,
+      DrmSessionManager<FrameworkMediaCrypto> drmSessionManager, ArrayList<Renderer> renderersList,
+      long allowedVideoJoiningTimeMs) {
     MediaCodecVideoRenderer videoRenderer = new MediaCodecVideoRenderer(context,
         MediaCodecSelector.DEFAULT, MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT,
         allowedVideoJoiningTimeMs, drmSessionManager, false, mainHandler, componentListener,
@@ -590,17 +611,23 @@ public final class SimpleExoPlayer implements ExoPlayer {
   }
 
   private void removeSurfaceCallbacks() {
-    if (this.textureView != null) {
-      this.textureView.setSurfaceTextureListener(null);
-      this.textureView = null;
+    if (textureView != null) {
+      if (textureView.getSurfaceTextureListener() != componentListener) {
+        Log.w(TAG, "SurfaceTextureListener already unset or replaced.");
+      } else {
+        textureView.setSurfaceTextureListener(null);
+      }
+      textureView = null;
     }
-    if (this.surfaceHolder != null) {
-      this.surfaceHolder.removeCallback(componentListener);
-      this.surfaceHolder = null;
+    if (surfaceHolder != null) {
+      surfaceHolder.removeCallback(componentListener);
+      surfaceHolder = null;
     }
   }
 
-  private void setVideoSurfaceInternal(Surface surface) {
+  private void setVideoSurfaceInternal(Surface surface, boolean ownsSurface) {
+    // Note: We don't turn this method into a no-op if the surface is being replaced with itself
+    // so as to ensure onRenderedFirstFrame callbacks are still called in this case.
     ExoPlayerMessage[] messages = new ExoPlayerMessage[videoRendererCount];
     int count = 0;
     for (Renderer renderer : renderers) {
@@ -608,17 +635,24 @@ public final class SimpleExoPlayer implements ExoPlayer {
         messages[count++] = new ExoPlayerMessage(renderer, C.MSG_SET_SURFACE, surface);
       }
     }
-    if (surface == null) {
-      // Block to ensure that the surface is not accessed after the method returns.
+    if (this.surface != null && this.surface != surface) {
+      // If we created this surface, we are responsible for releasing it.
+      if (this.ownsSurface) {
+        this.surface.release();
+      }
+      // We're replacing a surface. Block to ensure that it's not accessed after the method returns.
       player.blockingSendMessages(messages);
     } else {
       player.sendMessages(messages);
     }
+    this.surface = surface;
+    this.ownsSurface = ownsSurface;
   }
 
   private final class ComponentListener implements VideoRendererEventListener,
       AudioRendererEventListener, TextRenderer.Output, MetadataRenderer.Output<List<Id3Frame>>,
-      SurfaceHolder.Callback, TextureView.SurfaceTextureListener {
+      SurfaceHolder.Callback, TextureView.SurfaceTextureListener,
+      TrackSelector.EventListener<Object> {
 
     // VideoRendererEventListener implementation
 
@@ -669,8 +703,8 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
     @Override
     public void onRenderedFirstFrame(Surface surface) {
-      if (videoListener != null) {
-        videoListener.onRenderedFirstFrame(surface);
+      if (videoListener != null && SimpleExoPlayer.this.surface == surface) {
+        videoListener.onRenderedFirstFrame();
       }
       if (videoDebugListener != null) {
         videoDebugListener.onRenderedFirstFrame(surface);
@@ -679,9 +713,6 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
     @Override
     public void onVideoDisabled(DecoderCounters counters) {
-      if (videoListener != null) {
-        videoListener.onVideoDisabled(counters);
-      }
       if (videoDebugListener != null) {
         videoDebugListener.onVideoDisabled(counters);
       }
@@ -764,7 +795,7 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-      setVideoSurfaceInternal(holder.getSurface());
+      setVideoSurfaceInternal(holder.getSurface(), false);
     }
 
     @Override
@@ -774,14 +805,14 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-      setVideoSurfaceInternal(null);
+      setVideoSurfaceInternal(null, false);
     }
 
     // TextureView.SurfaceTextureListener implementation
 
     @Override
     public void onSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int width, int height) {
-      setVideoSurfaceInternal(new Surface(surfaceTexture));
+      setVideoSurfaceInternal(new Surface(surfaceTexture), true);
     }
 
     @Override
@@ -791,13 +822,30 @@ public final class SimpleExoPlayer implements ExoPlayer {
 
     @Override
     public boolean onSurfaceTextureDestroyed(SurfaceTexture surfaceTexture) {
-      setVideoSurface(null);
+      setVideoSurfaceInternal(null, true);
       return true;
     }
 
     @Override
     public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) {
       // Do nothing.
+    }
+
+    // TrackSelector.EventListener implementation
+
+    @Override
+    public void onTrackSelectionsChanged(TrackSelections<?> trackSelections) {
+      boolean videoTracksEnabled = false;
+      for (int i = 0; i < renderers.length; i++) {
+        if (renderers[i].getTrackType() == C.TRACK_TYPE_VIDEO && trackSelections.get(i) != null) {
+          videoTracksEnabled = true;
+          break;
+        }
+      }
+      if (videoListener != null && SimpleExoPlayer.this.videoTracksEnabled && !videoTracksEnabled) {
+        videoListener.onVideoTracksDisabled();
+      }
+      SimpleExoPlayer.this.videoTracksEnabled = videoTracksEnabled;
     }
 
   }

@@ -18,6 +18,7 @@ package com.google.android.exoplayer2.extractor.ts;
 import android.util.Pair;
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.Format;
+import com.google.android.exoplayer2.extractor.ExtractorOutput;
 import com.google.android.exoplayer2.extractor.TrackOutput;
 import com.google.android.exoplayer2.util.MimeTypes;
 import com.google.android.exoplayer2.util.NalUnitUtil;
@@ -34,6 +35,8 @@ import java.util.Collections;
   private static final int START_SEQUENCE_HEADER = 0xB3;
   private static final int START_EXTENSION = 0xB5;
   private static final int START_GROUP = 0xB8;
+
+  private TrackOutput output;
 
   // Maps (frame_rate_code - 1) indices to values, as defined in ITU-T H.262 Table 6-4.
   private static final double[] FRAME_RATE_VALUES = new double[] {
@@ -58,8 +61,7 @@ import java.util.Collections;
   private long framePosition;
   private long frameTimeUs;
 
-  public H262Reader(TrackOutput output) {
-    super(output);
+  public H262Reader() {
     prefixFlags = new boolean[4];
     csdBuffer = new CsdBuffer(128);
   }
@@ -71,6 +73,11 @@ import java.util.Collections;
     pesPtsUsAvailable = false;
     foundFirstFrameInGroup = false;
     totalBytesWritten = 0;
+  }
+
+  @Override
+  public void init(ExtractorOutput extractorOutput, TrackIdGenerator idGenerator) {
+    output = extractorOutput.track(idGenerator.getNextId());
   }
 
   @Override
@@ -128,7 +135,7 @@ import java.util.Collections;
       if (hasOutputFormat && (startCodeValue == START_GROUP || startCodeValue == START_PICTURE)) {
         int bytesWrittenPastStartCode = limit - startCodeOffset;
         if (foundFirstFrameInGroup) {
-          int flags = isKeyframe ? C.BUFFER_FLAG_KEY_FRAME : 0;
+          @C.BufferFlags int flags = isKeyframe ? C.BUFFER_FLAG_KEY_FRAME : 0;
           int size = (int) (totalBytesWritten - framePosition) - bytesWrittenPastStartCode;
           output.sampleMetadata(frameTimeUs, flags, size, bytesWrittenPastStartCode, null);
           isKeyframe = false;
@@ -136,7 +143,7 @@ import java.util.Collections;
         if (startCodeValue == START_GROUP) {
           foundFirstFrameInGroup = false;
           isKeyframe = true;
-        } else /* startCode == START_PICTURE */ {
+        } else /* startCodeValue == START_PICTURE */ {
           frameTimeUs = pesPtsUsAvailable ? pesTimeUs : (frameTimeUs + frameDurationUs);
           framePosition = totalBytesWritten - bytesWrittenPastStartCode;
           pesPtsUsAvailable = false;

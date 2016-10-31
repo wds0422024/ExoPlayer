@@ -35,7 +35,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
   private static final String TAG = "ExoPlayerImpl";
 
   private final Handler eventHandler;
-  private final ExoPlayerImplInternal internalPlayer;
+  private final ExoPlayerImplInternal<?> internalPlayer;
   private final CopyOnWriteArraySet<EventListener> listeners;
   private final Timeline.Window window;
   private final Timeline.Period period;
@@ -63,7 +63,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
    * @param loadControl The {@link LoadControl} that will be used by the instance.
    */
   @SuppressLint("HandlerLeak")
-  public ExoPlayerImpl(Renderer[] renderers, TrackSelector trackSelector, LoadControl loadControl) {
+  public ExoPlayerImpl(Renderer[] renderers, TrackSelector<?> trackSelector,
+      LoadControl loadControl) {
     Log.i(TAG, "Init " + ExoPlayerLibraryInfo.VERSION);
     Assertions.checkNotNull(renderers);
     Assertions.checkState(renderers.length > 0);
@@ -79,8 +80,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
       }
     };
     playbackInfo = new ExoPlayerImplInternal.PlaybackInfo(0, 0);
-    internalPlayer = new ExoPlayerImplInternal(renderers, trackSelector, loadControl, playWhenReady,
-        eventHandler, playbackInfo);
+    internalPlayer = new ExoPlayerImplInternal<>(renderers, trackSelector, loadControl,
+        playWhenReady, eventHandler, playbackInfo);
   }
 
   @Override
@@ -100,13 +101,19 @@ import java.util.concurrent.CopyOnWriteArraySet;
 
   @Override
   public void prepare(MediaSource mediaSource) {
-    prepare(mediaSource, true);
+    prepare(mediaSource, true, true);
   }
 
   @Override
-  public void prepare(MediaSource mediaSource, boolean resetPosition) {
-    timeline = null;
-    internalPlayer.setMediaSource(mediaSource, resetPosition);
+  public void prepare(MediaSource mediaSource, boolean resetPosition, boolean resetTimeline) {
+    if (resetTimeline && (timeline != null || manifest != null)) {
+      timeline = null;
+      manifest = null;
+      for (EventListener listener : listeners) {
+        listener.onTimelineChanged(null, null);
+      }
+    }
+    internalPlayer.prepare(mediaSource, resetPosition);
   }
 
   @Override
@@ -243,16 +250,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
     if (timeline == null || pendingSeekAcks > 0) {
       return maskingWindowPositionMs;
     } else {
-      int periodIndex = playbackInfo.periodIndex;
-      timeline.getPeriod(periodIndex, period);
-      int windowIndex = period.windowIndex;
-      timeline.getWindow(windowIndex, window);
-      if (window.firstPeriodIndex == periodIndex && window.lastPeriodIndex == periodIndex
-          && window.getPositionInFirstPeriodUs() == 0
-          && window.getDurationUs() == period.getDurationUs()) {
-        return C.usToMs(playbackInfo.bufferedPositionUs);
-      }
-      return getCurrentPosition();
+      timeline.getPeriod(playbackInfo.periodIndex, period);
+      return period.getPositionInWindowMs() + C.usToMs(playbackInfo.bufferedPositionUs);
     }
   }
 

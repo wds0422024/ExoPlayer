@@ -1,5 +1,50 @@
 # Release notes #
 
+### r2.0.4 ###
+
+This release contains important bug fixes. Users of earlier r2.0.x versions
+should proactively update to this version.
+
+* Fix crash on Jellybean devices when using playback controls
+  ([#1965](https://github.com/google/ExoPlayer/issues/1965)).
+
+### r2.0.3 ###
+
+* Fixed NullPointerException in ExtractorMediaSource
+  ([#1914](https://github.com/google/ExoPlayer/issues/1914)).
+* Fixed NullPointerException in HlsMediaPeriod
+  ([#1907](https://github.com/google/ExoPlayer/issues/1907)).
+* Fixed memory leak in PlaybackControlView
+  ([#1908](https://github.com/google/ExoPlayer/issues/1908)).
+* Fixed strict mode violation when using
+  SimpleExoPlayer.setVideoPlayerTextureView().
+* Fixed L3 Widevine provisioning
+  ([#1925](https://github.com/google/ExoPlayer/issues/1925)).
+* Fixed hiding of controls with use_controller="false"
+  ([#1919](https://github.com/google/ExoPlayer/issues/1919)).
+* Improvements to Cronet network stack extension.
+* Misc bug fixes.
+
+### r2.0.2 ###
+
+* Fixes for MergingMediaSource and sideloaded subtitles.
+  ([#1882](https://github.com/google/ExoPlayer/issues/1882),
+  [#1854](https://github.com/google/ExoPlayer/issues/1854),
+  [#1900](https://github.com/google/ExoPlayer/issues/1900)).
+* Reduced effect of application code leaking player references
+  ([#1855](https://github.com/google/ExoPlayer/issues/1855)).
+* Initial support for fragmented MP4 in HLS.
+* Misc bug fixes and minor features.
+
+### r2.0.1 ###
+
+* Fix playback of short duration content
+  ([#1837](https://github.com/google/ExoPlayer/issues/1837)).
+* Fix MergingMediaSource preparation issue
+  ([#1853](https://github.com/google/ExoPlayer/issues/1853)).
+* Fix live stream buffering (out of memory) issue
+  ([#1825](https://github.com/google/ExoPlayer/issues/1825)).
+
 ### r2.0.0 ###
 
 ExoPlayer 2.x is a major iteration of the library. It includes significant API
@@ -67,6 +112,13 @@ some of the motivations behind ExoPlayer 2.x
    ([#583](https://github.com/google/ExoPlayer/issues/583)).
  * Suppressed "Sending message to a Handler on a dead thread" warnings
    ([#426](https://github.com/google/ExoPlayer/issues/426)).
+
+### r1.5.12 ###
+
+* Improvements to Cronet network stack extension.
+* Fix bug in demo app introduced in r1.5.11 that caused L3 Widevine
+  provisioning requests to fail.
+* Misc bugfixes.
 
 ### r1.5.11 ###
 
